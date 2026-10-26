@@ -20,7 +20,7 @@ async def open_responses_endpoint(
     request: Request,
     credentials: HTTPAuthorizationCredentials = Security(security)
 ):
-
+    # Validación del Token Bearer
     if not credentials or credentials.credentials != API_SECRET_KEY:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -33,39 +33,59 @@ async def open_responses_endpoint(
         except Exception:
             body = {}
 
-        messages_to_process = []
+
+        raw_messages = []
         if isinstance(body, dict):
             if "messages" in body and isinstance(body["messages"], list):
-                messages_to_process = body["messages"]
+                raw_messages = body["messages"]
             elif "input" in body:
                 inp = body["input"]
                 if isinstance(inp, str):
-                    messages_to_process = [{"role": "user", "content": inp}]
+                    raw_messages = [{"role": "user", "content": inp}]
                 elif isinstance(inp, list):
-                    messages_to_process = inp
+                    raw_messages = inp
             elif "prompt" in body:
-                messages_to_process = [{"role": "user", "content": str(body["prompt"])}]
+                raw_messages = [{"role": "user", "content": str(body["prompt"])}]
         
-        if not messages_to_process:
-            messages_to_process = [{"role": "user", "content": "Hola"}]
+        if not raw_messages:
+            raw_messages = [{"role": "user", "content": "¿Cuál es la experiencia de Sandra?"}]
 
-        agent_result = run_agent_workflow(messages_to_process)
+        query_text = "Hola"
+        last_msg = raw_messages[-1]
+        if isinstance(last_msg, dict):
+            content = last_msg.get("content", "")
+            if isinstance(content, list):
+                text_parts = []
+                for part in content:
+                    if isinstance(part, dict) and "text" in part:
+                        text_parts.append(str(part["text"]))
+                    else:
+                        text_parts.append(str(part))
+                query_text = " ".join(text_parts)
+            else:
+                query_text = str(content)
+        else:
+            query_text = str(last_msg)
 
+        try:
+            agent_result = run_agent_workflow(query_text)
+        except Exception:
+            agent_result = run_agent_workflow(raw_messages)
+   
         response_text = ""
         citations = []
 
         if isinstance(agent_result, tuple) and len(agent_result) >= 2:
             response_text, citations = agent_result[0], agent_result[1]
         elif isinstance(agent_result, dict):
-            # Si el agente regresa un estado de LangGraph con historial de mensajes
             if "messages" in agent_result and agent_result["messages"]:
-                last_msg = agent_result["messages"][-1]
-                if hasattr(last_msg, "content"):
-                    response_text = last_msg.content
-                elif isinstance(last_msg, dict):
-                    response_text = last_msg.get("content", str(agent_result))
+                last_msg_res = agent_result["messages"][-1]
+                if hasattr(last_msg_res, "content"):
+                    response_text = last_msg_res.content
+                elif isinstance(last_msg_res, dict):
+                    response_text = last_msg_res.get("content", str(agent_result))
                 else:
-                    response_text = str(last_msg)
+                    response_text = str(last_msg_res)
             elif "response" in agent_result:
                 response_text = agent_result["response"]
             elif "output" in agent_result:

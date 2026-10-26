@@ -20,7 +20,7 @@ async def open_responses_endpoint(
     request: Request,
     credentials: HTTPAuthorizationCredentials = Security(security)
 ):
-    # Validación del Token Bearer
+
     if not credentials or credentials.credentials != API_SECRET_KEY:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -32,7 +32,6 @@ async def open_responses_endpoint(
             body = await request.json()
         except Exception:
             body = {}
-
 
         raw_messages = []
         if isinstance(body, dict):
@@ -50,28 +49,26 @@ async def open_responses_endpoint(
         if not raw_messages:
             raw_messages = [{"role": "user", "content": "¿Cuál es la experiencia de Sandra?"}]
 
-        query_text = "Hola"
-        last_msg = raw_messages[-1]
-        if isinstance(last_msg, dict):
-            content = last_msg.get("content", "")
-            if isinstance(content, list):
-                text_parts = []
-                for part in content:
-                    if isinstance(part, dict) and "text" in part:
-                        text_parts.append(str(part["text"]))
-                    else:
-                        text_parts.append(str(part))
-                query_text = " ".join(text_parts)
-            else:
-                query_text = str(content)
-        else:
-            query_text = str(last_msg)
+        sanitized_messages = []
+        for m in raw_messages:
+            if isinstance(m, dict):
+                role = str(m.get("role", "user"))
+                content = m.get("content", "")
+                
+                if isinstance(content, list):
+                    flat_content = " ".join(
+                        str(p.get("text", p)) if isinstance(p, dict) else str(p) 
+                        for p in content
+                    )
+                else:
+                    flat_content = str(content)
+                    
+                sanitized_messages.append({"role": role, "content": flat_content})
+            elif isinstance(m, str):
+                sanitized_messages.append({"role": "user", "content": m})
 
-        try:
-            agent_result = run_agent_workflow(query_text)
-        except Exception:
-            agent_result = run_agent_workflow(raw_messages)
-   
+        agent_result = run_agent_workflow(sanitized_messages)
+
         response_text = ""
         citations = []
 
@@ -79,13 +76,13 @@ async def open_responses_endpoint(
             response_text, citations = agent_result[0], agent_result[1]
         elif isinstance(agent_result, dict):
             if "messages" in agent_result and agent_result["messages"]:
-                last_msg_res = agent_result["messages"][-1]
-                if hasattr(last_msg_res, "content"):
-                    response_text = last_msg_res.content
-                elif isinstance(last_msg_res, dict):
-                    response_text = last_msg_res.get("content", str(agent_result))
+                last_msg = agent_result["messages"][-1]
+                if hasattr(last_msg, "content"):
+                    response_text = last_msg.content
+                elif isinstance(last_msg, dict):
+                    response_text = last_msg.get("content", str(agent_result))
                 else:
-                    response_text = str(last_msg_res)
+                    response_text = str(last_msg)
             elif "response" in agent_result:
                 response_text = agent_result["response"]
             elif "output" in agent_result:

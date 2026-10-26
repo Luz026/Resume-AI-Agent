@@ -1,6 +1,8 @@
 
 import os
 import logging
+import time
+import uuid
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request, Security, status
@@ -14,18 +16,35 @@ router = APIRouter()
 security = HTTPBearer(auto_error=False)
 logger = logging.getLogger(__name__)
 
-API_SECRET_KEY = os.getenv("AGENT_API_KEY")
+
+class OutputText(BaseModel):
+    type: str = "output_text"
+    text: str
+    annotations: list[dict[str, Any]] = Field(default_factory=list)
+    logprobs: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class OutputMessage(BaseModel):
+    id: str
+    type: str = "message"
+    status: str = "completed"
+    role: str = "assistant"
+    content: list[OutputText]
 
 
 class OpenResponse(BaseModel):
-    # Estado terminal compatible con clientes que esperan una respuesta final.
+    id: str
+    object: str = "response"
+    created_at: int
     status: str = "completed"
-    response: str
+    output: list[OutputMessage]
+    error: Any = None
+    incomplete_details: Any = None
     citations: list[str] = Field(default_factory=list)
 
 
 def content_to_text(content: Any) -> str:
-    """Convierte contenido de mensajes a texto de forma segura."""
+    """Convierte el contenido del agente a texto."""
 
     if isinstance(content, str):
         return content
@@ -37,9 +56,9 @@ def content_to_text(content: Any) -> str:
             if isinstance(item, str):
                 parts.append(item)
             elif isinstance(item, dict):
-                text_value = item.get("text")
-                if isinstance(text_value, str):
-                    parts.append(text_value)
+                value = item.get("text")
+                if isinstance(value, str):
+                    parts.append(value)
 
         return " ".join(parts)
 
@@ -50,45 +69,53 @@ def content_to_text(content: Any) -> str:
 
 
 def normalize_messages(raw_messages: list) -> list[dict[str, str]]:
-    """Valida y normaliza la estructura de los mensajes."""
+    """Valida y normaliza los mensajes recibidos."""
 
     normalized = []
     allowed_roles = {"system", "user", "assistant"}
 
     for message in raw_messages:
         if isinstance(message, str):
-            content = message
             role = "user"
+            content = message
 
         elif isinstance(message, dict):
             role = message.get("role", "user")
-            content = content_to_text(message.get("content", ""))
+
+            if not isinstance(role, str) or role not in allowed_roles:
+                raise HTTPException(
+                    status_code=400,
+                    detail="El rol de uno de los mensajes no es válido.",
+                )
+
+            # Admite mensajes de formato Open Responses y chat tradicional.
+            content = content_to_text(
+                message.get("content", message.get("text", ""))
+            )
 
         else:
             raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
+                status_code=400,
                 detail="Cada mensaje debe ser texto o un objeto JSON válido.",
             )
 
-        if not isinstance(role, str) or role not in allowed_roles:
+        if not isinstance(content, str):
             raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="El rol de uno de los mensajes no es válido.",
+                status_code=400,
+                detail="El contenido de cada mensaje debe ser texto.",
             )
 
-        if not content.strip():
-            continue
-
-        normalized.append({
-            "role": role,
-            "content": content,
-        })
+        if content.strip():
+            normalized.append({
+                "role": role,
+                "content": content,
+            })
 
     return normalized
 
 
 def extract_agent_result(agent_result: Any) -> tuple[str, list[str]]:
-    """Extrae el texto final y las citas del resultado del agente."""
+    """Extrae la respuesta final y las citas del agente."""
 
     response_text = ""
     citations: list[str] = []
@@ -117,16 +144,37 @@ def extract_agent_result(agent_result: Any) -> tuple[str, list[str]]:
         if "response" in agent_result:
             response_text = content_to_text(agent_result["response"])
 
+        elif isinstance(agent_result.get("output"), list):
+            # Admite output con mensajes de Open Responses.
+            for item in reversed(agent_result["output"]):
+                if not isinstance(item, dict):
+                    continue
+
+                if item.get("type") != "message":
+                    continue
+
+                if item.get("role") != "assistant":
+                    continue
+
+                response_text = content_to_text(item.get("content", []))
+                if response_text.strip():
+                    break
+
         elif "output" in agent_result:
             response_text = content_to_text(agent_result["output"])
 
         elif isinstance(agent_result.get("messages"), list):
             for message in reversed(agent_result["messages"]):
                 if isinstance(message, dict):
-                    role = message.get("role")
-                    content = content_to_text(message.get("content", ""))
+                    role = message.get("role", message.get("type"))
+                    content = content_to_text(
+                        message.get("content", "")
+                    )
                 else:
-                    role = getattr(message, "type", None)
+                    role = getattr(
+                        message, "type",
+                        getattr(message, "role", None)
+                    )
                     content = content_to_text(
                         getattr(message, "content", "")
                     )
@@ -146,7 +194,7 @@ async def open_responses_endpoint(
     request: Request,
     credentials: HTTPAuthorizationCredentials = Security(security),
 ):
-    """Endpoint para ejecutar el agente de CV."""
+    """Endpoint compatible con respuestas JSON de Open Responses."""
 
     api_secret_key = os.getenv("AGENT_API_KEY")
 
@@ -166,13 +214,13 @@ async def open_responses_endpoint(
             body = await request.json()
         except Exception:
             raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
+                status_code=400,
                 detail="El cuerpo de la petición debe ser JSON válido.",
             )
 
         if not isinstance(body, dict):
             raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
+                status_code=400,
                 detail="El cuerpo debe ser un objeto JSON.",
             )
 
@@ -183,14 +231,14 @@ async def open_responses_endpoint(
             value = body["input"]
 
             if isinstance(value, str):
-                raw_messages = [
-                    {"role": "user", "content": value}
-                ]
+                raw_messages = [{"role": "user", "content": value}]
+
             elif isinstance(value, list):
                 raw_messages = value
+
             else:
                 raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
+                    status_code=400,
                     detail="'input' debe ser texto o una lista de mensajes.",
                 )
 
@@ -199,25 +247,23 @@ async def open_responses_endpoint(
 
             if not isinstance(value, str):
                 raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
+                    status_code=400,
                     detail="'prompt' debe ser una cadena de texto.",
                 )
 
-            raw_messages = [
-                {"role": "user", "content": value}
-            ]
+            raw_messages = [{"role": "user", "content": value}]
 
         else:
             raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Debes proporcionar 'messages', 'input' o 'prompt'.",
+                status_code=400,
+                detail="Debes proporcionar 'input', 'messages' o 'prompt'.",
             )
 
         messages = normalize_messages(raw_messages)
 
         if not messages:
             raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
+                status_code=400,
                 detail="No se recibieron mensajes válidos.",
             )
 
@@ -231,7 +277,7 @@ async def open_responses_endpoint(
 
             if not validation.get("is_safe", False):
                 raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
+                    status_code=400,
                     detail=validation.get(
                         "reason",
                         "El mensaje no superó la validación de seguridad.",
@@ -249,22 +295,44 @@ async def open_responses_endpoint(
         if not response_text:
             logger.error("El agente terminó sin producir texto.")
             raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
+                status_code=502,
                 detail="El agente no produjo una respuesta final.",
             )
 
         response_text = SecurityGuardrails.sanitize_output(response_text)
 
-        safe_citations = [
-            SecurityGuardrails.sanitize_output(citation)
+        safe_citations = sorted({
+            SecurityGuardrails.sanitize_output(str(citation))
             for citation in citations
-            if citation.strip()
-        ]
+            if citation is not None and str(citation).strip()
+        })
+
+        response_id = uuid.uuid4().hex
 
         return OpenResponse(
+            id=f"resp_{response_id}",
+            object="response",
+            created_at=int(time.time()),
             status="completed",
-            response=response_text,
-            citations=sorted(set(safe_citations)),
+            output=[
+                OutputMessage(
+                    id=f"msg_{response_id}",
+                    type="message",
+                    status="completed",
+                    role="assistant",
+                    content=[
+                        OutputText(
+                            type="output_text",
+                            text=response_text,
+                            annotations=[],
+                            logprobs=[],
+                        )
+                    ],
+                )
+            ],
+            error=None,
+            incomplete_details=None,
+            citations=safe_citations,
         )
 
     except HTTPException:
@@ -273,6 +341,6 @@ async def open_responses_endpoint(
     except Exception:
         logger.exception("Error durante la ejecución del endpoint")
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            status_code=500,
             detail="Error interno durante la ejecución del agente.",
         )

@@ -14,7 +14,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
 
 from app.agent.graph import run_agent_workflow
-from app.agent.security import SecurityGuardrails
+from app.core.security import SecurityGuardrails
 
 router = APIRouter()
 security = HTTPBearer(auto_error=False)
